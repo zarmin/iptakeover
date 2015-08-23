@@ -1,0 +1,145 @@
+#!/bin/bash -e
+
+cd "$(dirname "${0}")"
+. iptakeover.conf
+
+if [ -z "$1" ]; then
+  echo "Usage:"
+  echo "  $0 status: print status information"
+  echo "  $0 takeover: takeover the cluster ip"
+  echo ""
+  exit 1
+fi
+
+declare -a current_node
+declare -a another_node
+declare -a current_node_ip
+declare -a another_node_ip
+SSH_CMD="ssh -o ConnectTimeout=3 -o ConnectionAttempts=2 "
+
+function get_current_node() {
+  LOCAL_PRIMARY_IP="$(hostname --ip-address)"
+  if [ "${NODE1_IP}" = "${LOCAL_PRIMARY_IP}" ]; then
+    current_node=NODE1
+  fi
+  if [ "${NODE2_IP}" = "${LOCAL_PRIMARY_IP}" ]; then
+    current_node=NODE2
+  fi
+
+  if [ -z "$current_node" ]; then
+    >&2 echo "Current node is not part of the cluster, primary IP not found in node1/node2"
+    exit 1
+  fi
+
+  if [ "${current_node}" = "NODE1" ]; then
+    another_node=NODE2
+    current_node_ip=$NODE1_IP
+    another_node_ip=$NODE2_IP
+    current_node_eth=$NODE1_CLUSTER_ETH
+    another_node_eth=$NODE2_CLUSTER_ETH
+  else
+    another_node=NODE1
+    current_node_ip=$NODE2_IP
+    another_node_ip=$NODE1_IP
+    current_node_eth=$NODE2_CLUSTER_ETH
+    another_node_eth=$NODE1_CLUSTER_ETH
+  fi
+
+  return 0
+}
+
+function bring_up_local() {
+  echo "Bringing up IP address..."
+  ifconfig $current_node_eth $CLUSTER_IP netmask $CLUSTER_NETMASK up
+  sleep 2
+  echo "Arp broadcasting..."
+  arping -i $(echo "$current_node_eth" | sed 's/:.*//') -c 3 -S $CLUSTER_NETMASK $ARP_BROADCAST_TO
+  sleep 1
+
+  if [ -n "$COMMAND_TO_BRING_UP" ]; then
+    $COMMAND_TO_BRING_UP
+  fi
+}
+
+if [ "$1" = "status" ]; then
+  get_current_node
+
+  echo "Current node: ${current_node} (${current_node_ip})"
+
+  # Checking another node
+  another_node_has_ip=0
+  if $SSH_CMD "${another_node_ip}" 'ip addr' | grep -q $CLUSTER_IP; then
+    another_node_has_ip=1
+    echo "Another node, ${another_node} has the cluster IP"
+  fi
+
+  current_node_has_ip=0
+  if ip addr | grep -q $CLUSTER_IP; then
+    current_node_has_ip=1
+    echo "Current node, ${current_node} has the cluster IP"
+  fi
+
+  exit_code=0
+  cluster_ip_pings=0
+  if ping -c 2 -i 0.3 -w 3 -q $CLUSTER_IP > /dev/null; then
+    cluster_ip_pings=1
+    echo "Cluster ip, ${CLUSTER_IP} accessible"
+  else
+    >&2 echo " !!! CRITICAL: Cluster ip, ${CLUSTER_IP} is not accessible!"
+    exit_code=1
+  fi
+
+  if [ $another_node_has_ip -eq 1 ] && [ $current_node_has_ip -eq 1 ]; then
+    >&2 echo " !!! CRITICAL: Both nodes have the cluster IP!"
+    exit 1
+  fi
+
+  if [ $another_node_has_ip -eq 0 ] && [ $current_node_has_ip -eq 0 ]; then
+    >&2 echo " !!! CRITICAL: None of the nodes have the cluster IP"
+    exit 1
+  fi
+
+  exit $exit_code
+fi
+
+if [ "$1" = "takeover" ]; then
+  get_current_node
+
+  if ip addr | grep -q $CLUSTER_IP; then
+    echo "You have the cluster IP, unable to takeover it!"
+    exit 1
+  fi
+
+  if [ -n "$COMMAND_CHECK_BEFORE_TAKEOVER" ]; then
+    if ! "$COMMAND_CHECK_BEFORE_TAKEOVER"; then
+      echo " !!! STOPPED: Command check before takeover failure: ${COMMAND_CHECK_BEFORE_TAKEOVER}"
+      exit 1
+    fi
+  fi
+
+  read -p "Are you sure to want to takeover? (Y/n)" RESP
+  if [ "$RESP" != "Y" ]; then
+    echo "Aborted!"
+    exit 0
+  fi
+
+  echo "Taking over..."
+  sleep 2
+
+  if [ -n "$COMMAND_TO_TAKE_DOWN" ]; then
+    $SSH_CMD $another_node_ip "$COMMAND_TO_TAKE_DOWN"
+  fi
+
+  echo "Taking down another node's ${another_node_ip} IP..."
+  if ! ( $SSH_CMD $another_node_ip "ifconfig $another_node_eth 0.0.0.0 netmask 255.255.255.0 down 2> /dev/null || true" ) ; then
+    echo " !!! WARNING: Cannot access another node..."
+  fi
+  sleep 2
+
+  echo "Bringing up local..."
+  bring_up_local
+
+  exit 0
+fi
+
+>&2 echo "Invalid argument, $1"
